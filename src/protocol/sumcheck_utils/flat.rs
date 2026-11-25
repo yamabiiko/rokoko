@@ -1,3 +1,5 @@
+use std::{ops::Range, sync::LazyLock, thread};
+
 use crate::{
     common::{
         config::MOD_Q,
@@ -7,7 +9,7 @@ use crate::{
         common::{FlatTerm, HighOrderSumcheckData},
         elephant_cell::ElephantCell,
         hypercube_point::HypercubePoint,
-        linear::LinearSumcheck,
+        linear::LinearReadView,
         polynomial::{add_poly_in_place, Polynomial},
     },
 };
@@ -16,9 +18,26 @@ type Cell = ElephantCell<dyn HighOrderSumcheckData<Element = RingElement>>;
 type Term<'a> = FlatTerm<'a, RingElement>;
 
 const CHUNK: usize = 32;
+// Roughly 2048 quadratic pair evaluations per worker. Count active arithmetic,
+// since the same pair can participate in many constraints.
+const MIN_WORK_PER_WORKER: usize = 12_288;
+
+fn worker_limit() -> usize {
+    static LIMIT: LazyLock<usize> = LazyLock::new(|| {
+        std::env::var("ROKOKO_SUMCHECK_THREADS").map_or(1, |value| {
+            value
+                .parse::<usize>()
+                .ok()
+                .filter(|&n| n > 0)
+                .expect("ROKOKO_SUMCHECK_THREADS must be a positive integer")
+        })
+    });
+    *LIMIT
+}
 
 pub struct FlatRounds {
     rounds: usize,
+    workers: usize,
     previous: std::cell::RefCell<Vec<Polynomial<RingElement>>>,
 }
 
@@ -28,7 +47,7 @@ struct Plan<'a> {
     start: usize,
     end: usize,
     slots: Vec<usize>,
-    inactive: Vec<&'a LinearSumcheck<RingElement>>,
+    inactive: Vec<LinearReadView<'a>>,
     claims: Vec<&'a RingElement>,
     rounds: Vec<(bool, &'a RingElement)>,
     shift: Option<u32>,
@@ -50,7 +69,8 @@ impl Plan<'_> {
 }
 
 struct Slot<'a> {
-    table: &'a LinearSumcheck<RingElement>,
+    table: LinearReadView<'a>,
+    identity: usize,
     pairs: usize,
     mapped: Vec<RingElement>,
     slopes: Vec<RingElement>,
@@ -90,6 +110,8 @@ fn flatten(_: &Cell) -> Option<Vec<Term<'_>>> {
 }
 
 impl FlatRounds {
+    /// ROKOKO_SUMCHECK_THREADS opts into parallel flat sweeps (default: 1).
+    /// Small rounds stay sequential; folding and the gadget fallback are unchanged.
     pub fn new(outputs: &[Cell], total_vars: usize) -> FlatRounds {
         let mut any = false;
         let mut full = true;
@@ -108,6 +130,7 @@ impl FlatRounds {
             } else {
                 0
             },
+            workers: worker_limit(),
             previous: std::cell::RefCell::new(vec![]),
         }
     }
@@ -132,15 +155,6 @@ impl FlatRounds {
         }
         let previous = self.previous.take();
         let skip = challenge.is_some() && previous.len() == plans.len();
-        let mut accumulators: Vec<Accumulator> = plans
-            .iter()
-            .map(|plan| Accumulator {
-                sums: vec![zero(); points(plan.degree())],
-                run: vec![zero(); if plan.weighted() { points(plan.degree()) } else { 0 }],
-                key: None,
-                anchor: 0,
-            })
-            .collect();
         for plan in &plans {
             if points(plan.degree()) == 4 {
                 for &slot in &plan.slots {
@@ -157,69 +171,49 @@ impl FlatRounds {
         bounds.sort_unstable();
         bounds.dedup();
 
-        let mut product = zero();
-        let mut scratch = if plans.iter().any(|plan| plan.slots.len() == 3) {
-            vec![zero(); CHUNK]
+        let windows = windows(&plans, &slots, &bounds);
+        let ranges = partitions(&windows, self.workers);
+        let _sweep_span =
+            tracing::info_span!("sumcheck::flat_sweep", workers = ranges.len()).entered();
+        let mut accumulators = new_accumulators(&plans);
+        if ranges.len() <= 1 {
+            sweep(
+                &plans,
+                &mut slots,
+                &windows,
+                0..usize::MAX,
+                skip,
+                &mut accumulators,
+            );
         } else {
-            vec![]
-        };
-        let mut used = vec![false; slots.len()];
-        let mut members: Vec<usize> = vec![];
-        for window in bounds.windows(2) {
-            let (from, to) = (window[0], window[1]);
-            members.clear();
-            members.extend((0..plans.len()).filter(|&m| plans[m].start <= from && to <= plans[m].end));
-            if members.is_empty() {
-                continue;
-            }
-            used.iter_mut().for_each(|u| *u = false);
-            for &m in &members {
-                for &slot in &plans[m].slots {
-                    used[slot] = true;
-                }
-            }
-            let width = slots
-                .iter()
-                .zip(&used)
-                .filter(|(_, u)| **u)
-                .map(|(slot, _)| slot.pairs)
-                .fold(CHUNK, usize::min);
-            let mut x = from;
-            while x < to {
-                let y = to.min((x / width + 1) * width);
-                for (slot, _) in slots.iter_mut().zip(&used).filter(|(_, u)| **u) {
-                    prepare(slot, x, y);
-                }
-                for &m in &members {
-                    let plan = &plans[m];
-                    let accumulator = &mut accumulators[m];
-                    let mut u = x;
-                    while u < y {
-                        let v = match plan.shift {
-                            Some(shift) => y.min(((u >> shift) + 1) << shift),
-                            None => y,
-                        };
-                        let key = plan.shift.map_or(0, |shift| u >> shift);
-                        if accumulator.key != Some(key) {
-                            flush(plan, accumulator, skip, &mut product);
-                            accumulator.key = Some(key);
-                            accumulator.anchor = u;
-                        }
-                        let target = if plan.weighted() {
-                            &mut accumulator.run
-                        } else {
-                            &mut accumulator.sums
-                        };
-                        accumulate(plan, &slots, u - x, v - u, skip, target, &mut scratch, &mut product);
-                        u = v;
+            let partials = thread::scope(|scope| {
+                let jobs: Vec<_> = ranges
+                    .into_iter()
+                    .map(|range| {
+                        let (plans, windows, prototypes) = (&plans, &windows, &slots);
+                        scope.spawn(move || {
+                            let mut local_slots: Vec<_> =
+                                prototypes.iter().map(Slot::workspace).collect();
+                            let mut local = new_accumulators(plans);
+                            sweep(plans, &mut local_slots, windows, range, skip, &mut local);
+                            local
+                        })
+                    })
+                    .collect();
+                jobs.into_iter()
+                    .map(|job| job.join().expect("sumcheck worker panicked"))
+                    .collect::<Vec<_>>()
+            });
+            // Reduce in worker order, before the previous-round correction and interpolation.
+            for partial in partials {
+                for (total, local) in accumulators.iter_mut().zip(partial) {
+                    for (sum, value) in total.sums.iter_mut().zip(local.sums) {
+                        *sum += &value;
                     }
                 }
-                x = y;
             }
         }
-        for (plan, accumulator) in plans.iter().zip(accumulators.iter_mut()) {
-            flush(plan, accumulator, skip, &mut product);
-        }
+        drop(_sweep_span);
         if let Some(r) = challenge.filter(|_| skip) {
             for (accumulator, previous) in accumulators.iter_mut().zip(previous.iter()) {
                 let mut at = previous.coefficients[previous.num_coefficients - 1].clone();
@@ -240,7 +234,9 @@ impl FlatRounds {
             let mut poly = Polynomial::<RingElement>::new(0);
             poly.num_coefficients = 0;
             match terms {
-                None => outputs[output].get_ref().univariate_polynomial_into(&mut poly),
+                None => outputs[output]
+                    .get_ref()
+                    .univariate_polynomial_into(&mut poly),
                 Some(_) => {
                     poly.num_coefficients = 1;
                     for (plan, accumulator) in plans.iter().zip(&accumulators) {
@@ -286,6 +282,196 @@ impl FlatRounds {
     }
 }
 
+struct Window {
+    from: usize,
+    to: usize,
+    members: Vec<usize>,
+    used: Vec<usize>,
+    width: usize,
+    cost: usize,
+}
+
+impl Slot<'_> {
+    fn workspace(&self) -> Self {
+        Self {
+            table: self.table,
+            identity: self.identity,
+            pairs: self.pairs,
+            mapped: vec![zero(); self.mapped.len()],
+            slopes: vec![zero(); self.slopes.len()],
+            twos: vec![],
+            base: 0,
+            needs_two: self.needs_two,
+        }
+    }
+}
+
+fn new_accumulators(plans: &[Plan<'_>]) -> Vec<Accumulator> {
+    plans
+        .iter()
+        .map(|plan| Accumulator {
+            sums: vec![zero(); points(plan.degree())],
+            run: vec![
+                zero();
+                if plan.weighted() {
+                    points(plan.degree())
+                } else {
+                    0
+                }
+            ],
+            key: None,
+            anchor: 0,
+        })
+        .collect()
+}
+
+fn windows(plans: &[Plan<'_>], slots: &[Slot<'_>], bounds: &[usize]) -> Vec<Window> {
+    bounds
+        .windows(2)
+        .filter_map(|bounds| {
+            let (from, to) = (bounds[0], bounds[1]);
+            let members: Vec<_> = (0..plans.len())
+                .filter(|&m| plans[m].start <= from && to <= plans[m].end)
+                .collect();
+            if members.is_empty() {
+                return None;
+            }
+            let mut used = vec![false; slots.len()];
+            for &m in &members {
+                for &slot in &plans[m].slots {
+                    used[slot] = true;
+                }
+            }
+            let used: Vec<_> = used
+                .iter()
+                .enumerate()
+                .filter_map(|(i, &u)| u.then_some(i))
+                .collect();
+            let width = used.iter().map(|&i| slots[i].pairs).fold(CHUNK, usize::min);
+            let cost = members
+                .iter()
+                .map(|&i| {
+                    let plan = &plans[i];
+                    points(plan.degree()) * plan.slots.len()
+                })
+                .sum();
+            Some(Window {
+                from,
+                to,
+                members,
+                used,
+                width,
+                cost,
+            })
+        })
+        .collect()
+}
+
+// Contiguous partitions weighted by active arithmetic, not just ambient cube size.
+// A small-round cutoff avoids spawning workers for the tail.
+fn partitions(windows: &[Window], limit: usize) -> Vec<Range<usize>> {
+    let Some(first) = windows.first() else {
+        return vec![];
+    };
+    let last = windows.last().unwrap().to;
+    let active_pairs: usize = windows.iter().map(|w| w.to - w.from).sum();
+    let total: usize = windows.iter().map(|w| (w.to - w.from) * w.cost).sum();
+    let workers = limit
+        .min(total / MIN_WORK_PER_WORKER)
+        .min(active_pairs / CHUNK)
+        .max(1);
+    if workers == 1 {
+        return vec![first.from..last];
+    }
+    let mut cuts = vec![first.from];
+    let mut before = 0;
+    let mut next = 1;
+    for w in windows {
+        let end = before + (w.to - w.from) * w.cost;
+        while next < workers && total * next / workers < end {
+            let target = total * next / workers;
+            let cut = w.from + (target.saturating_sub(before) / w.cost);
+            let cut = cut.div_ceil(CHUNK) * CHUNK;
+            let cut = cut.min(w.to);
+            if cut > *cuts.last().unwrap() && cut < last {
+                cuts.push(cut);
+            }
+            next += 1;
+        }
+        before = end;
+    }
+    cuts.push(last);
+    cuts.windows(2).map(|c| c[0]..c[1]).collect()
+}
+
+fn sweep(
+    plans: &[Plan<'_>],
+    slots: &mut [Slot<'_>],
+    windows: &[Window],
+    range: Range<usize>,
+    skip: bool,
+    accumulators: &mut [Accumulator],
+) {
+    let mut product = zero();
+    let mut scratch = if plans.iter().any(|plan| plan.slots.len() == 3) {
+        vec![zero(); CHUNK]
+    } else {
+        vec![]
+    };
+    for window in windows {
+        let from = window.from.max(range.start);
+        let to = window.to.min(range.end);
+        if from >= to {
+            continue;
+        }
+        let width = window.width;
+        let mut x = from;
+        while x < to {
+            let y = to.min((x / width + 1) * width);
+            for &slot in &window.used {
+                prepare(&mut slots[slot], x, y);
+            }
+            for &m in &window.members {
+                let plan = &plans[m];
+                let accumulator = &mut accumulators[m];
+                let mut u = x;
+                while u < y {
+                    let v = match plan.shift {
+                        Some(shift) => y.min(((u >> shift) + 1) << shift),
+                        None => y,
+                    };
+                    let key = plan.shift.map_or(0, |shift| u >> shift);
+                    if accumulator.key != Some(key) {
+                        flush(plan, accumulator, skip, &mut product);
+                        accumulator.key = Some(key);
+                        accumulator.anchor = u;
+                    }
+                    let target = if plan.weighted() {
+                        &mut accumulator.run
+                    } else {
+                        &mut accumulator.sums
+                    };
+                    accumulate(
+                        plan,
+                        slots,
+                        u - x,
+                        v - u,
+                        skip,
+                        target,
+                        &mut scratch,
+                        &mut product,
+                    );
+                    u = v;
+                }
+            }
+            x = y;
+        }
+    }
+    for (plan, accumulator) in plans.iter().zip(accumulators.iter_mut()) {
+        flush(plan, accumulator, skip, &mut product);
+    }
+}
+
 fn plan<'a>(output: usize, term: &Term<'a>, slots: &mut Vec<Slot<'a>>) -> Plan<'a> {
     let mut start = 0;
     let mut end = usize::MAX;
@@ -315,12 +501,16 @@ fn plan<'a>(output: usize, term: &Term<'a>, slots: &mut Vec<Slot<'a>>) -> Plan<'
         }
         if table.is_folding() {
             half = half.max(table.len() / 2);
-            let slot = match slots.iter().position(|s| std::ptr::eq(s.table, table)) {
+            let slot = match slots
+                .iter()
+                .position(|s| s.identity == table as *const _ as usize)
+            {
                 Some(slot) => slot,
                 None => {
                     let width = CHUNK.min(table.len() / 2);
                     slots.push(Slot {
-                        table,
+                        table: table.read_view(),
+                        identity: table as *const _ as usize,
                         pairs: table.len() / 2,
                         mapped: if table.values().is_none() {
                             vec![zero(); 2 * width]
@@ -341,7 +531,7 @@ fn plan<'a>(output: usize, term: &Term<'a>, slots: &mut Vec<Slot<'a>>) -> Plan<'
                 let s = table.suffix() as u32 - 1;
                 shift = Some(shift.map_or(s, |t| t.min(s)));
             }
-            inactive.push(table);
+            inactive.push(table.read_view());
         }
     }
     end = end.min(half);
@@ -424,7 +614,11 @@ fn accumulate(
 ) {
     match plan.slots[..] {
         [a] => {
-            for (k, sum) in target.iter_mut().enumerate().filter(|(k, _)| !skip || *k != 1) {
+            for (k, sum) in target
+                .iter_mut()
+                .enumerate()
+                .filter(|(k, _)| !skip || *k != 1)
+            {
                 let (values, step) = operand(&slots[a], k, offset);
                 for i in 0..count {
                     *sum += &values[i * step];
@@ -432,7 +626,11 @@ fn accumulate(
             }
         }
         [a, b] => {
-            for (k, sum) in target.iter_mut().enumerate().filter(|(k, _)| !skip || *k != 1) {
+            for (k, sum) in target
+                .iter_mut()
+                .enumerate()
+                .filter(|(k, _)| !skip || *k != 1)
+            {
                 let (left, left_step) = operand(&slots[a], k, offset);
                 let (right, right_step) = operand(&slots[b], k, offset);
                 if count == 1 {
@@ -444,7 +642,11 @@ fn accumulate(
             }
         }
         [a, b, c] => {
-            for (k, sum) in target.iter_mut().enumerate().filter(|(k, _)| !skip || *k != 1) {
+            for (k, sum) in target
+                .iter_mut()
+                .enumerate()
+                .filter(|(k, _)| !skip || *k != 1)
+            {
                 let (left, left_step) = operand(&slots[a], k, offset);
                 let (middle, middle_step) = operand(&slots[b], k, offset);
                 let (right, right_step) = operand(&slots[c], k, offset);
@@ -467,7 +669,7 @@ fn flush(plan: &Plan, accumulator: &mut Accumulator, skip: bool, product: &mut R
     for value in plan
         .inactive
         .iter()
-        .map(|table| &table[point])
+        .map(|table| table.at(point))
         .chain(plan.claims.iter().copied())
     {
         match &mut weight {
@@ -547,6 +749,80 @@ fn interpolate(degree: usize, sums: &[RingElement], out: &mut Polynomial<RingEle
             v *= &RingElement::constant((MOD_Q + 1) / 2, Representation::IncompleteNTT);
             c[2].set_from(&v);
             c[1] -= (&u, &v);
+        }
+    }
+}
+
+#[cfg(all(test, feature = "unsafe-sumcheck"))]
+mod tests {
+    use super::*;
+    use crate::{
+        common::{init_common, sampling::sample_random_short_vector},
+        protocol::sumcheck_utils::{
+            common::SumcheckBaseData, diff::DiffSumcheck, linear::LinearSumcheck,
+            product::ProductSumcheck, selector_eq::SelectorEq,
+        },
+    };
+
+    #[test]
+    fn parallel_rounds_match_serial_with_shared_mapped_and_weighted_tables() {
+        init_common();
+        let n = 1usize << 15;
+        let vars = n.ilog2() as usize;
+        let mut data = sample_random_short_vector(n, 30, Representation::IncompleteNTT);
+        for value in &mut data[n - 17..] {
+            value.set_zero();
+        }
+        let witness = ElephantCell::new(LinearSumcheck::from_data_with_non_zero_end(
+            data.clone(),
+            n - 17,
+        ));
+        let other = ElephantCell::new(LinearSumcheck::from_data(sample_random_short_vector(
+            n,
+            30,
+            Representation::IncompleteNTT,
+        )));
+        // SAFETY: data remains alive and immutable until the graph is dropped below.
+        let conjugate = ElephantCell::new(unsafe { LinearSumcheck::conjugate_of(&data, n - 17) });
+        let weights = ElephantCell::new(LinearSumcheck::from_data_with_prefixed_sufixed_data(
+            sample_random_short_vector(4, 10, Representation::IncompleteNTT),
+            0,
+            vars - 2,
+        ));
+        let selector = ElephantCell::new(SelectorEq::new(2, 2, vars));
+        let pair = ElephantCell::new(ProductSumcheck::new(witness.clone(), other.clone()));
+        let cubic = ElephantCell::new(ProductSumcheck::new(pair.clone(), conjugate.clone()));
+        let selected = ElephantCell::new(ProductSumcheck::new(cubic, selector.clone()));
+        let weighted = ElephantCell::new(ProductSumcheck::new(witness.clone(), weights.clone()));
+        let outputs: Vec<Cell> = vec![
+            ElephantCell::new(DiffSumcheck::new(selected, weighted)),
+            pair,
+        ];
+        let mut serial = FlatRounds::new(&outputs, vars);
+        serial.workers = 1;
+        let mut parallel = FlatRounds::new(&outputs, vars);
+        parallel.workers = 3; // exercises cuts inside weighted runs, not just dyadic halves
+        let mut eight = FlatRounds::new(&outputs, vars);
+        eight.workers = 8;
+        let gammas = sample_random_short_vector(2, 10, Representation::IncompleteNTT);
+        let challenges = sample_random_short_vector(vars, 10, Representation::IncompleteNTT);
+        for round in 0..serial.rounds() {
+            let previous = round.checked_sub(1).map(|i| &challenges[i]);
+            let expected = serial.round_polynomial(&outputs, &gammas, previous);
+            for flat in [&parallel, &eight] {
+                let actual = flat.round_polynomial(&outputs, &gammas, previous);
+                assert_eq!(
+                    actual.num_coefficients, expected.num_coefficients,
+                    "round {round}"
+                );
+                assert_eq!(actual.coefficients, expected.coefficients, "round {round}");
+            }
+            let r = &challenges[round];
+            witness.borrow_mut().partial_evaluate(r);
+            other.borrow_mut().partial_evaluate(r);
+            conjugate.borrow_mut().partial_evaluate(r);
+            weights.borrow_mut().partial_evaluate(r);
+            selector.borrow_mut().partial_evaluate(r);
         }
     }
 }

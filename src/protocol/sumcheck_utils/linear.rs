@@ -62,6 +62,69 @@ impl LinearSumcheck<RingElement> {
     }
 }
 
+/// Immutable numerical state for a flat sweep. Contains no gadget scratch or cells.
+/// The owner must finish the sweep before folding/replacing the source table.
+#[derive(Clone, Copy)]
+pub(crate) struct LinearReadView<'a> {
+    data: &'a [RingElement],
+    map: Option<fn(&RingElement, &mut RingElement)>,
+    suffix: usize,
+    variable_count: usize,
+    index_mask: usize,
+}
+
+impl LinearReadView<'_> {
+    pub(crate) fn values(&self) -> Option<&[RingElement]> {
+        self.map.is_none().then_some(self.data)
+    }
+
+    pub(crate) fn pair_into(&self, point: usize, even: &mut RingElement, odd: &mut RingElement) {
+        let p = point & (self.data.len() / 2 - 1);
+        match self.map {
+            Some(map) => {
+                map(&self.data[2 * p], even);
+                map(&self.data[2 * p + 1], odd);
+            }
+            None => {
+                even.set_from(&self.data[2 * p]);
+                odd.set_from(&self.data[2 * p + 1]);
+            }
+        }
+    }
+
+    pub(crate) fn at(&self, point: HypercubePoint) -> &RingElement {
+        let data = self
+            .values()
+            .expect("a mapped table has no stored entries to index");
+        if data.len() == 1 {
+            return &data[0];
+        }
+        if self.suffix > 0
+            || self.variable_count > data.len().trailing_zeros() as usize + self.suffix
+        {
+            let shift = self.suffix.saturating_sub(1);
+            return &data[(point.coordinates >> shift) & self.index_mask];
+        }
+        &data[2 * (point.coordinates & (data.len() / 2 - 1))]
+    }
+}
+
+impl LinearSumcheck<RingElement> {
+    pub(crate) fn read_view(&self) -> LinearReadView<'_> {
+        let (data, map) = match &self.borrowed {
+            Some(borrowed) => (&*borrowed.data, borrowed.map),
+            None => (self.data.as_slice(), None),
+        };
+        LinearReadView {
+            data,
+            map,
+            suffix: self.suffix,
+            variable_count: self.variable_count,
+            index_mask: self.index_mask,
+        }
+    }
+}
+
 /// Standard linear sumcheck over a vector that represents a multilinear extension.
 pub struct LinearSumcheck<E: SumcheckElement = RingElement> {
     pub data: Vec<E>,
@@ -288,12 +351,6 @@ impl<E: SumcheckElement> LinearSumcheck<E> {
 
     pub(crate) fn suffix(&self) -> usize {
         self.suffix
-    }
-
-    pub(crate) fn pair_into(&self, point: usize, even: &mut E, odd: &mut E) {
-        let p = point & (self.len() / 2 - 1);
-        self.load(2 * p, even);
-        self.load(2 * p + 1, odd);
     }
 
     fn load(&self, index: usize, out: &mut E) {

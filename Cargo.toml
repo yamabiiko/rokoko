@@ -66,3 +66,7 @@ harness = false
 [[bench]]
 name = "eltwise_bench"
 harness = false
+
+[[example]]
+name = "sumcheck_fold_parallel"
+required-features = ["parallel"]
